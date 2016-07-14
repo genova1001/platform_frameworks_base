@@ -307,5 +307,8 @@
 
     <bool name="config_show_long_operator_name">false</bool>
     <bool name="config_show_long_operator_name_when_roaming">false</bool>
+    
+    <!-- Double tap anywhere in lockscreen makes the device go to sleep -->
+    <bool name="config_doubletap_lockscreen_sleep">true</bool>
 </resources>
 
