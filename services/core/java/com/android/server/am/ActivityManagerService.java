@@ -54,7 +54,6 @@ import com.android.server.SystemServiceManager;
 import com.android.server.Watchdog;
 import com.android.server.am.ActivityStack.ActivityState;
 import com.android.server.firewall.IntentFirewall;
-import com.android.server.om.OverlayManagerService;
 import com.android.server.pm.Installer;
 import com.android.server.statusbar.StatusBarManagerInternal;
 import com.android.server.vr.VrManagerInternal;
@@ -65,6 +64,7 @@ import org.xmlpull.v1.XmlPullParserException;
 import org.xmlpull.v1.XmlSerializer;
 
 import android.Manifest;
+import android.annotation.NonNull;
 import android.annotation.UserIdInt;
 import android.app.Activity;
 import android.app.ActivityManager;
@@ -3143,6 +3143,15 @@ public final class ActivityManagerService extends ActivityManagerNative
                 if (task == null) {
                     return;
                 }
+                if (mUserController.shouldConfirmCredentials(task.userId)) {
+                    mActivityStarter.showConfirmDeviceCredential(task.userId);
+                    if (task.stack != null && task.stack.mStackId == FREEFORM_WORKSPACE_STACK_ID) {
+                        mStackSupervisor.moveTaskToStackLocked(task.taskId,
+                                FULLSCREEN_WORKSPACE_STACK_ID, !ON_TOP, !FORCE_FOCUS,
+                                "setFocusedTask", ANIMATE);
+                    }
+                    return;
+                }
                 final ActivityRecord r = task.topRunningActivityLocked();
                 if (setFocusedActivityLocked(r, "setFocusedTask")) {
                     mStackSupervisor.resumeFocusedStackTopActivityLocked();
@@ -3931,16 +3940,19 @@ public final class ActivityManagerService extends ActivityManagerNative
             app.killed = false;
             app.killedByAm = false;
             checkTime(startTime, "startProcess: starting to update pids map");
+            ProcessRecord oldApp;
             synchronized (mPidsSelfLocked) {
-                ProcessRecord oldApp;
-                // If there is already an app occupying that pid that hasn't been cleaned up
-                if ((oldApp = mPidsSelfLocked.get(startResult.pid)) != null && !app.isolated) {
-                    // Clean up anything relating to this pid first
-                    Slog.w(TAG, "Reusing pid " + startResult.pid
-                            + " while app is still mapped to it");
-                    cleanUpApplicationRecordLocked(oldApp, false, false, -1,
-                            true /*replacingPid*/);
-                }
+                oldApp = mPidsSelfLocked.get(startResult.pid);
+            }
+            // If there is already an app occupying that pid that hasn't been cleaned up
+            if (oldApp != null && !app.isolated) {
+                // Clean up anything relating to this pid first
+                Slog.w(TAG, "Reusing pid " + startResult.pid
+                        + " while app is still mapped to it");
+                cleanUpApplicationRecordLocked(oldApp, false, false, -1,
+                        true /*replacingPid*/);
+            }
+            synchronized (mPidsSelfLocked) {
                 this.mPidsSelfLocked.put(startResult.pid, app);
                 if (isActivityProcess) {
                     Message msg = mHandler.obtainMessage(PROC_START_TIMEOUT_MSG);
@@ -6682,8 +6694,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                     isRestrictedBackupMode || !normalMode, app.persistent,
                     new Configuration(mConfiguration), app.compat,
                     getCommonServicesLocked(app.isolated),
-                    mCoreSettingsObserver.getCoreSettingsLocked(),
-                    getAssetPaths(appInfo.packageName, app.userId));
+                    mCoreSettingsObserver.getCoreSettingsLocked());
             updateLruProcessLocked(app, false, null);
             app.lastRequestedGc = app.lastLowMemory = SystemClock.uptimeMillis();
         } catch (Exception e) {
@@ -6767,13 +6778,6 @@ public final class ActivityManagerService extends ActivityManagerNative
         }
 
         return true;
-    }
-
-    private List<String[]> getAssetPaths(String packageName, int userId)
-        throws NameNotFoundException {
-
-        OverlayManagerService oms = LocalServices.getService(OverlayManagerService.class);
-        return oms.getAllAssetPaths(packageName, userId);
     }
 
     @Override
@@ -11965,6 +11969,12 @@ public final class ActivityManagerService extends ActivityManagerNative
                 final long ident = Binder.clearCallingIdentity();
                 try {
                     final int currentUserId = mUserController.getCurrentUserIdLocked();
+
+                    // Drop locked freeform tasks out into the fullscreen stack.
+                    // TODO: Redact the tasks in place. It's much better to keep them on the screen
+                    //       where they were before, but in an obscured state.
+                    mStackSupervisor.moveProfileTasksFromFreeformToFullscreenStackLocked(userId);
+
                     if (mUserController.isLockScreenDisabled(currentUserId)) {
                         // If there is no device lock, we will show the profile's credential page.
                         mActivityStarter.showConfirmDeviceCredential(userId);
@@ -19047,47 +19057,52 @@ public final class ActivityManagerService extends ActivityManagerNative
     /**
      * @hide
      */
-    public void updateAssets(int userId, Map<String,String[]> overlays) {
+    @Override
+    public void updateAssets(final int userId, @NonNull final List<String> packageNames) {
         enforceCallingPermission(android.Manifest.permission.CHANGE_CONFIGURATION, "updateAssets()");
 
         synchronized(this) {
             final long origId = Binder.clearCallingIdentity();
             try {
-                updateAssetsLocked(userId, overlays);
+                updateAssetsLocked(userId, packageNames);
             } finally {
                 Binder.restoreCallingIdentity(origId);
             }
         }
     }
 
-    void updateAssetsLocked(int userId, Map<String, String[]> overlays) {
-        String[] systemOverlayPaths = null;
-        if (overlays.keySet().contains("android")) {
-            systemOverlayPaths = overlays.get("android");
-            mSystemThread.applyAssetsChangedToResources(systemOverlayPaths);
-        }
-        for (int i = mLruProcesses.size() - 1; i >= 0; i--) {
-            ProcessRecord app = mLruProcesses.get(i);
-            try {
-                if (app.userId != userId || app.thread == null) {
-                    continue;
-                }
-                String packageName = app.info.packageName;
-                if ("android".equals(packageName)) {
-                    continue;
-                }
-                if (systemOverlayPaths != null) {
-                    app.thread.scheduleAssetsChanged(systemOverlayPaths);
-                }
-                if (overlays.keySet().contains(packageName)) {
-                    app.thread.scheduleAssetsChanged(overlays.get(packageName));
-                }
-            } catch (Exception e) {}
-        }
+    void updateAssetsLocked(final int userId, @NonNull final List<String> packagesToUpdate) {
+        final IPackageManager pm = AppGlobals.getPackageManager();
+        final Map<String, ApplicationInfo> cache = new ArrayMap<>();
 
-        Configuration config = new Configuration(mConfiguration);
-        config.assetSeq++;
-        updateConfiguration(config);
+        final boolean updateFrameworkRes = packagesToUpdate.contains("android");
+        for (int i = mLruProcesses.size() - 1; i >= 0; i--) {
+            final ProcessRecord app = mLruProcesses.get(i);
+            if (app.userId != userId || app.thread == null) {
+                continue;
+            }
+
+            for (final String packageName : app.pkgList.keySet()) {
+                if (updateFrameworkRes || packagesToUpdate.contains(packageName)) {
+                    try {
+                        final ApplicationInfo ai;
+                        if (cache.containsKey(packageName)) {
+                            ai = cache.get(packageName);
+                        } else {
+                            ai = pm.getApplicationInfo(packageName, 0, userId);
+                            cache.put(packageName, ai);
+                        }
+
+                        if (ai != null) {
+                            app.thread.scheduleAssetsChanged(packageName, ai);
+                        }
+                    } catch (RemoteException e) {
+                        Slog.w(TAG, String.format("Failed to update %s assets for %s",
+                                    packageName, app));
+                    }
+                }
+            }
+        }
     }
 
     /**
