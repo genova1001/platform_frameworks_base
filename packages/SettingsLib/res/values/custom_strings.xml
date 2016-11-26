@@ -13,7 +13,7 @@
 -->
 <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
 
-    <!-- Cuistom lockscreen shortcuts -->
+    <!-- Custom lockscreen shortcuts -->
     <string name="profile_applist_title">Apps</string>
     <string name="picker_activities">Activities</string>
     <string name="select_custom_app_title">Select custom app</string>
